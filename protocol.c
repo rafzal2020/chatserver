@@ -4,19 +4,6 @@
 #include <unistd.h>
 #include "protocol.h"
 
-/*
- * read_exactly - helper to read exactly n bytes from fd into buf.
- * Returns 0 on success, -1 if connection closed or error.
- */
-static int read_exactly(int fd, char *buf, int n) {
-    int total = 0;
-    while (total < n) {
-        int r = read(fd, buf + total, n - total);
-        if (r <= 0) return -1;   // 0 = disconnected, <0 = error
-        total += r;
-    }
-    return 0;
-}
 
 /*
  * read_until_bar - reads one byte at a time until '|', storing into buf.
@@ -48,34 +35,48 @@ static int read_until_bar(int fd, char *buf, int max) {
  * The body_len field tells us exactly how many bytes follow the third '|'.
  * We read exactly that many bytes — no more, no less.
  */
+// In protocol.c
 int read_message(int fd, char *code, char *body, int *body_len) {
-    char version_buf[8];
-    char length_buf[8];
+    char c;
+    int r;
 
-    // Read version field (up to 7 chars before '|')
-    if (read_until_bar(fd, version_buf, 7) < 0) return -1;
+    // Only eat whitespace (\n, \r, spaces)
+    while (1) {
+        r = read(fd, &c, 1);
+        if (r <= 0) return -1; // Disconnected
+        if (c == '\n' || c == '\r' || c == ' ') continue; 
+        break; 
+    }
 
-    // Spec says version is always "1"
-    if (strcmp(version_buf, "1") != 0) return -1;
+    // Check Version (Fatal Error 0 if not '1')
+    if (c != '1') {
+        return -2; // Special code for "Unknown Version"
+    }
 
-    // Read code field — exactly 3 chars before '|'
+    // Read the rest of the version header until the '|'
+    r = read(fd, &c, 1);
+    if (r <= 0 || c != '|') return -1; // Ill-formed
+
+    // Read Code (3 chars)
     if (read_until_bar(fd, code, 3) < 0) return -1;
-    if (strlen(code) != 3) return -1;
 
-    // Read length field (up to 5 digits before '|')
-    if (read_until_bar(fd, length_buf, 5) < 0) return -1;
+    // Read Length
+    char len_str[16];
+    if (read_until_bar(fd, len_str, 15) < 0) return -1;
+    int length = atoi(len_str);
+    *body_len = length;
 
-    // Convert length to integer
-    int len = atoi(length_buf);
-    if (len < 0 || len > MAX_BODY_LEN) return -1;
+    // Read Body
+    r = read(fd, body, length);
+    if (r != length) return -1; // Ill-formed (math mismatch)
+    body[length] = '\0';
 
-    // Read exactly len bytes for the body
-    if (read_exactly(fd, body, len) < 0) return -1;
-    body[len] = '\0';
-    *body_len = len;
-
-    // The body must end with '|' per the spec
-    if (len == 0 || body[len - 1] != '|') return -1;
+    // Final Bar Check (Fatal Error 0 if missing)
+    if (body[length - 1] != '|') {
+	    printf("DEBUG: Protocol Violation. Expected '|' at byte %d, got '%c'\n",
+                length - 1, body[length - 1]);
+	    return -1;
+    }
 
     return 0;
 }
@@ -88,12 +89,14 @@ int read_message(int fd, char *code, char *body, int *body_len) {
  */
 void send_message(int fd, const char *code, const char *body) {
     int body_len = strlen(body);
-    char header[32];
+    char header[64];
     // Format: "1|CODE|12345|"
     int header_len = snprintf(header, sizeof(header), "1|%s|%d|", code, body_len);
     // Write header then body as two separate writes
     write(fd, header, header_len);
     write(fd, body, body_len);
+
+    write(fd, "\n", 1);
 }
 
 /*

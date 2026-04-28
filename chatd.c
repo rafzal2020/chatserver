@@ -7,6 +7,8 @@
 #include <pthread.h>
 
 #include "client.h"
+#include "protocol.h"
+#include "handlers.h"
 
 // --- Forward declaration ---
 void *handle_client(void *arg);
@@ -97,12 +99,57 @@ void *handle_client(void *arg) {
     int slot = *(int *)arg;
     free(arg);
 
-    // TODO: message parsing loop goes here
+    // Get a local copy of the file descriptor so we don't need to lock the array constantly
+    pthread_mutex_lock(&clients_lock);
+    int fd = clients[slot].fd;
+    pthread_mutex_unlock(&clients_lock);
+
+    char code[4];
+    char body[MAX_MSG_BODY];
+    int body_len;
+
+    // Message parsing loop
+    // In chatd.c inside handle_client
+    while (1) {
+    	int res = read_message(fd, code, body, &body_len);
+
+    	if (res == -1 || res == -2) {
+        	// Error 0: Fatal (Ill-formed or Unknown Version)
+        	send_error(fd, 0, "Unreadable or unknown version");
+        	usleep(100000); // gives the client a time window to print the fatal error before closing out.
+		break;
+    	} else if (res < 0) {
+        	// Normal client disconnect
+        	break;
+    	}
+
+	char *fields[8];
+
+    	// Parse fields
+    	int nfields = parse_fields(body, body_len, fields, 8);
+
+    	// Route to handlers
+    	if (strcmp(code, "NAM") == 0) {
+        	handle_nam(slot, fields, nfields);
+    	} else if (strcmp(code, "SET") == 0) {
+        	handle_set(slot, fields, nfields);
+    	} else if (strcmp(code, "MSG") == 0) {
+        	handle_msg(slot, fields, nfields);
+    	} else if (strcmp(code, "WHO") == 0) {
+        	handle_who(slot, fields, nfields);
+    	} else {
+        	// Error 0: Fatal (Unknown message type)
+        	send_error(fd, 0, "Unknown message type");
+        	break;
+    	}
+    }
+
 
     // Cleanup when client disconnects
     pthread_mutex_lock(&clients_lock);
     close(clients[slot].fd);
     client_remove(slot);
+    printf("Client in slot %d disconnected.\n", slot);
     pthread_mutex_unlock(&clients_lock);
 
     return NULL;
